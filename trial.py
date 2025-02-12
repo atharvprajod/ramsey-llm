@@ -53,8 +53,12 @@ class RamseyValidator:
         k = self.config.k
         eps = self.config.epsilon
         
-        # R(k,ε) ≤ (k+1) * (c/ε)^(k^2(d-k))
-        return (k + 1) * (c / eps) ** (k * k * (d - k))
+        # Calculate in log space to avoid overflow
+        # log(R(k,ε)) = log(k+1) + (k^2(d-k)) * log(c/ε)
+        log_result = np.log(k + 1) + (k * k * (d - k)) * np.log(c / eps)
+        
+        # Return the log of the bound to avoid overflow
+        return log_result
     
     def find_monochromatic_clique(self, embeddings: np.ndarray) -> Tuple[np.ndarray, float]:
         """Find a (k+1)-clique with differences well-approximated by a k-dim subspace."""
@@ -93,7 +97,7 @@ class RamseyValidator:
         """Phase 1: Verify Ramsey bounds with synthetic data."""
         self.logger.info("Running synthetic verification...")
         
-        theoretical_R = self.theoretical_ramsey_bound()
+        log_theoretical_R = self.theoretical_ramsey_bound()
         observed_Rs = []
         
         for _ in range(self.config.num_trials):
@@ -110,14 +114,28 @@ class RamseyValidator:
                 observed_Rs.append(self.config.num_samples)
                 
         # Statistical validation
-        observed_R = np.mean(observed_Rs)
-        t_stat, p_value = ttest_1samp(observed_Rs, theoretical_R)
+        if len(observed_Rs) > 1:  # Need at least 2 samples for std calculation
+            observed_R = np.mean(observed_Rs)
+            log_observed_R = np.log(observed_R)
+            log_observed_Rs = [np.log(r) for r in observed_Rs]
+            std_log_observed = np.std(log_observed_Rs, ddof=1)  # Use N-1 for sample std
+            
+            if std_log_observed > 0:  # Only do t-test if there's variation
+                t_stat, p_value = ttest_1samp(log_observed_Rs, log_theoretical_R)
+                effect_size = (log_theoretical_R - log_observed_R) / std_log_observed
+            else:
+                t_stat, p_value = 0.0, 1.0
+                effect_size = 0.0
+        else:
+            log_observed_R = float('inf') if not observed_Rs else np.log(observed_Rs[0])
+            t_stat, p_value = 0.0, 1.0
+            effect_size = 0.0
         
         return {
-            "theoretical_R": theoretical_R,
-            "observed_R": observed_R,
+            "log_theoretical_R": log_theoretical_R,
+            "log_observed_R": log_observed_R,
             "p_value": p_value,
-            "effect_size": (theoretical_R - observed_R) / np.std(observed_Rs)
+            "effect_size": effect_size
         }
 
 class ModelValidator(RamseyValidator):
@@ -249,7 +267,7 @@ class ModelLoader:
         model.eval()  # Set to evaluation mode
         return model, tokenizer
 
-class EnhancedModelValidator(RamseyValidator):
+class EnhancedModelValidator(ModelValidator):
     """Extended validator with specific support for GPT-3 and LLaMA-2."""
     
     def __init__(self, config: ValidationConfig, model_name: str):
@@ -257,7 +275,20 @@ class EnhancedModelValidator(RamseyValidator):
         self.model_name = model_name
         self.model_config = ModelRegistry.get_config(model_name)
         self.loader = ModelLoader()
-        
+    
+    def extract_embeddings(self, model: nn.Module, 
+                          tokens: torch.Tensor) -> np.ndarray:
+        """Extract embeddings specific to each model architecture."""
+        with torch.no_grad():
+            if self.model_name == "gpt3":
+                embeddings = model.embed_in(tokens)
+            elif self.model_name == "llama2":
+                embeddings = model.embed_tokens(tokens)
+            else:
+                raise ValueError(f"Unknown model type: {self.model_name}")
+                
+        return embeddings.cpu().numpy()
+    
     def prepare_validation_data(self, tokenizer: AutoTokenizer, 
                               num_tokens: int = 1000) -> torch.Tensor:
         """Prepare a diverse set of tokens for validation."""
@@ -278,6 +309,52 @@ class EnhancedModelValidator(RamseyValidator):
                 raise ValueError(f"Unknown model type: {self.model_name}")
                 
         return embeddings.cpu().numpy()
+    
+    def compare_hypotheses(self, model: nn.Module, 
+                          tokens: torch.Tensor) -> Dict[str, float]:
+        """Phase 2: Compare GRH vs LRH predictions."""
+        embeddings = self.extract_embeddings(model, tokens)
+        
+        # GRH: Find Ramsey-theoretic subspaces
+        grh_clique, grh_error = self.find_monochromatic_clique(embeddings)
+        
+        # LRH: Use PCA to find linear subspaces
+        pca = PCA(n_components=self.config.k)
+        pca.fit(embeddings)
+        lrh_subspace = pca.components_
+        
+        # Compare coherence scores
+        grh_coherence = self.compute_subspace_coherence(embeddings, grh_clique)
+        lrh_coherence = self.compute_subspace_coherence(embeddings, lrh_subspace)
+        
+        return {
+            "grh_coherence": grh_coherence,
+            "lrh_coherence": lrh_coherence,
+            "delta": grh_coherence - lrh_coherence,
+            "p_value": ttest_1samp([grh_coherence - lrh_coherence], 0.0)[1]
+        }
+    
+    def interpretability_analysis(self, embeddings: np.ndarray) -> Dict[str, float]:
+        """Phase 3: Evaluate practical utility of Ramsey subspaces."""
+        # Find stable subspaces
+        clique, _ = self.find_monochromatic_clique(embeddings)
+        
+        # Measure subspace stability under resampling
+        stabilities = []
+        for _ in range(self.config.num_trials):
+            subset = embeddings[np.random.choice(len(embeddings), 
+                                               size=len(embeddings)//2, 
+                                               replace=False)]
+            new_clique, _ = self.find_monochromatic_clique(subset)
+            
+            # Compute subspace overlap
+            overlap = np.abs(np.dot(clique.T, new_clique)).mean()
+            stabilities.append(overlap)
+            
+        return {
+            "mean_stability": np.mean(stabilities),
+            "std_stability": np.std(stabilities)
+        }
     
     def run_full_validation(self, num_tokens: int = 1000) -> Dict[str, Dict]:
         """Run complete validation suite on specified model."""
