@@ -21,7 +21,44 @@ from sklearn.decomposition import PCA
 from tqdm import tqdm
 import logging
 from dataclasses import dataclass
+from transformers import (
+    GPTNeoXModel, 
+    GPTNeoXTokenizerFast,  # Use the Fast tokenizer
+    LlamaModel, 
+    LlamaTokenizer,
+    AutoModelForCausalLM,
+    AutoTokenizer
+)
+from dataclasses import dataclass
 
+@dataclass
+class ModelConfig:
+    name: str
+    embedding_dim: int
+    model_path: str
+
+class ModelRegistry:
+    """Registry of supported models and their configurations."""
+    
+    SUPPORTED_MODELS = {
+        "gpt3": ModelConfig(
+            name="gpt3",
+            embedding_dim=12288,  # 12k dimensions
+            model_path="EleutherAI/gpt-neox-20b"  # Using NeoX as GPT-3 proxy since actual GPT-3 isn't directly available
+        ),
+        "llama2": ModelConfig(
+            name="llama2",
+            embedding_dim=4096,  # 4k dimensions
+            model_path="meta-llama/Llama-2-7b-hf"  # Using 7B variant
+        )
+    }
+    
+    @classmethod
+    def get_config(cls, model_name: str) -> ModelConfig:
+        if model_name not in cls.SUPPORTED_MODELS:
+            raise ValueError(f"Unsupported model: {model_name}. " 
+                           f"Supported models: {list(cls.SUPPORTED_MODELS.keys())}")
+        return cls.SUPPORTED_MODELS[model_name]
 
 @dataclass
 class ValidationConfig:
@@ -195,12 +232,18 @@ class ModelValidator(RamseyValidator):
 class GRHEnhancedValidator(RamseyValidator):
     def __init__(self, config: ValidationConfig):
         super().__init__(config)
+        self.embeddings = None  # Initialize embeddings attribute
         self.manifold_analysis = ManifoldAnalyzer(config)
         self.ensemble_params = {
             'M': 50,    # Number of ensemble members
             'ρ': 0.8,   # Subsampling ratio
             'k': 3      # Subspace dimension
         }
+
+    def set_embeddings(self, embeddings: torch.Tensor):
+        """Set embeddings for validation"""
+        self.embeddings = embeddings.to(self.device)
+
 
     def ramsey_clique_finder(self, k=3, ε=0.1, max_iter=1000):
         """Enhanced clique finder with manifold-aware search"""
@@ -211,7 +254,7 @@ class GRHEnhancedValidator(RamseyValidator):
         for _ in range(max_iter):
             seed = torch.randint(0, n, (1,)).item()
             candidates = [seed]
-            
+            self.embeddings = self.embeddings.to(self.device)
             for i in range(k):
                 current_diff = self.embeddings[candidates] - self.embeddings[candidates].mean(0)
                 _, _, V = torch.svd_lowrank(current_diff, q=min(i+2, d))
@@ -309,13 +352,54 @@ class ManifoldAnalyzer:
         # Requires access to local neighborhood data
         pass
 
+class ModelLoader:
+    """Handles loading and preparation of different model architectures."""
+    
+    def __init__(self, device: str = "cuda" if torch.cuda.is_available() else "cpu"):
+        self.device = device
+        self.logger = logging.getLogger("ModelLoader")
+    
+    def load_model_and_tokenizer(self, model_name: str) -> Tuple[nn.Module, AutoTokenizer]:
+        """Load specified model and its tokenizer."""
+        config = ModelRegistry.get_config(model_name)
+        self.logger.info(f"Loading {model_name} from {config.model_path}")
+        
+        if model_name == "gpt3":
+            # Using GPT-NeoX as a proxy for GPT-3 architecture
+            tokenizer = GPTNeoXTokenizerFast.from_pretrained(config.model_path)
+            tokenizer.pad_token = tokenizer.eos_token  # Add padding token
+            model = GPTNeoXModel.from_pretrained(config.model_path)
+        elif model_name == "llama2":
+            tokenizer = LlamaTokenizer.from_pretrained(config.model_path)
+            tokenizer.pad_token = tokenizer.eos_token  # Add padding token
+            model = LlamaModel.from_pretrained(config.model_path)
+        else:
+            raise ValueError(f"Unknown model: {model_name}")
+            
+        model = model.to(self.device)
+        model.eval()  # Set to evaluation mode
+        return model, tokenizer
+    
+    # Add to ModelLoader class
+    def extract_embeddings(self, model: nn.Module, tokenizer: AutoTokenizer, text: str) -> torch.Tensor:
+        """Proper embedding extraction with token handling"""
+        tokens = tokenizer(text, return_tensors="pt", padding=True).input_ids.to(self.device)
+        with torch.no_grad():
+            return model.embed_tokens(tokens).squeeze(0)
+
+
+
 class EnhancedModelLoader(ModelLoader):
     """Extended loader with scaling capabilities"""
-    def scale_embeddings(self, model, tokenizer, scale_factor: float):
-        """Generate scaled embeddings for dimensional analysis"""
-        base_embeddings = super().extract_embeddings(model, tokenizer)
-        scaled = base_embeddings * torch.tensor([scale_factor], device=self.device)
-        return scaled + torch.randn_like(scaled) * 0.01  # Add small noise
+    def scale_embeddings(self, model, tokenizer, text: str, scale_factor: float):
+        """Proper scaled embedding generation"""
+        base_emb = super().extract_embeddings(model, tokenizer, text)
+        return base_emb * scale_factor
+    # def scale_embeddings(self, model, tokenizer, scale_factor: float):
+    #     """Generate scaled embeddings for dimensional analysis"""
+    #     base_embeddings = super().extract_embeddings(model, tokenizer)
+    #     scaled = base_embeddings * torch.tensor([scale_factor], device=self.device)
+    #     return scaled + torch.randn_like(scaled) * 0.01  # Add small noise
 
 class StabilityDataset(Dataset):
     """Dataset for stability analysis across resampling trials"""
@@ -331,28 +415,24 @@ class StabilityDataset(Dataset):
         return self.embeddings[subset_idx]
 
 def main():
-    config = ValidationConfig(
-        dimension=4096,
-        k=3,
-        epsilon=0.1,
-        num_samples=10000,
-        num_trials=50
-    )
-    
+    config = ValidationConfig(...)
     validator = GRHEnhancedValidator(config)
     loader = EnhancedModelLoader()
     
-    # Example workflow
-    model, tokenizer = loader.load_model_and_tokenizer("meta-llama/llama-2-7b-hf")
-    embeddings = loader.extract_embeddings(model, tokenizer)
+    model, tokenizer = loader.load_model_and_tokenizer("llama2")
+    embeddings = loader.extract_embeddings(
+        model, 
+        tokenizer,
+        "The quick brown fox jumps over the lazy dog"
+    )
     
-    # Enhanced analyses
-    ensemble_subspace = validator.ensemble_grh(embeddings)
-    stability = validator.subspace_stability(embeddings)
+    validator.set_embeddings(embeddings)  # Critical initialization
+    
+    # Now run analyses
+    ensemble_subspace = validator.ensemble_grh()
+    stability = validator.subspace_stability()
     scaling_results = validator.dimensional_scaling_analysis(model, tokenizer)
-    
-    print(f"Ensemble Stability: {stability:.4f}")
-    print("Dimensional Scaling Results:", scaling_results)
+
 
 if __name__ == "__main__":
     main()
